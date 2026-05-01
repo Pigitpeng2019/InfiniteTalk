@@ -1,0 +1,126 @@
+# =============================================================================
+# Docker Compose for InfiniteTalk
+# =============================================================================
+# Prerequisites:
+#   1. Install nvidia-container-toolkit (see docs/deployment.md)
+#   2. Place model weights in ./weights/
+#   3. Set HF_TOKEN env or configure huggingface-cli login
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── Download Models ─────────────────────────────────────────────────────────
+  # Run once to download model weights:
+  #   docker compose run --rm download-models
+  download-models:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: infinitetalk:latest
+    container_name: infinitetalk-download
+    command: ["bash", "/app/scripts/download_models.sh"]
+    volumes:
+      - ./weights:/app/weights
+      - huggingface_cache:/app/.cache/huggingface
+    environment:
+      - HF_HOME=/app/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - no_proxy=localhost,127.0.0.1,::1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 0
+              capabilities: [gpu]
+
+  # ── Gradio UI Service ───────────────────────────────────────────────────────
+  gradio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: infinitetalk:latest
+    container_name: infinitetalk-gradio
+    ports:
+      - "8418:8418"
+    volumes:
+      - ./weights:/app/weights
+      - ./outputs:/app/outputs
+      - huggingface_cache:/app/.cache/huggingface
+    environment:
+      - HF_HOME=/app/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=8418
+      - GRADIO_DEBUG=false
+      - no_proxy=localhost,127.0.0.1,::1
+    command: >
+      python app.py
+      --ckpt_dir /app/weights/Wan2.1-I2V-14B-480P
+      --wav2vec_dir /app/weights/chinese-wav2vec2-base
+      --infinitetalk_dir /app/weights/InfiniteTalk/single/infinitetalk.safetensors
+      --num_persistent_param_in_dit 0
+      --motion_frame 9
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility, compute]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    shm_size: "32gb"
+
+  # ── API Service ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: infinitetalk:latest
+    container_name: infinitetalk-api
+    depends_on:
+      download-models:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - "8419:8419"
+    volumes:
+      - ./weights:/app/weights
+      - ./outputs:/app/outputs
+      - huggingface_cache:/app/.cache/huggingface
+    environment:
+      - HF_HOME=/app/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - no_proxy=localhost,127.0.0.1,::1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; exit(0 if urllib.request.urlopen('http://localhost:8419/api/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "32gb"
+    command: >
+      python api_server.py
+        --ckpt_dir /app/weights/Wan2.1-I2V-14B-480P
+        --wav2vec_dir /app/weights/chinese-wav2vec2-base
+        --infinitetalk_dir /app/weights/InfiniteTalk/single/infinitetalk.safetensors
+        --num_persistent_param_in_dit 0
+        --motion_frame 9
+        --port 8419
+
+volumes:
+  huggingface_cache:

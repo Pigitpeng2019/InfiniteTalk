@@ -295,23 +295,22 @@ def custom_init(device, wav2vec):
 def loudness_norm(audio_array, sr=16000, lufs=-23):
     meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(audio_array)
-    if abs(loudness) > 100 or np.isnan(loudness):
+    if abs(loudness) > 100:
         return audio_array
     normalized_audio = pyln.normalize.loudness(audio_array, loudness, lufs)
     return normalized_audio
 
 def audio_prepare_multi(left_path, right_path, audio_type, sample_rate=16000):
 
-    if left_path is None or right_path is None or left_path == 'None' or right_path == 'None':
-        if left_path is None or left_path == 'None':
-            human_speech_array2 = audio_prepare_single(right_path)
-            human_speech_array1 = np.zeros(human_speech_array2.shape[0])
-        elif right_path is None or right_path == 'None':
-            human_speech_array1 = audio_prepare_single(left_path)
-            human_speech_array2 = np.zeros(human_speech_array1.shape[0])
-    else:
+    if not (left_path=='None' or right_path=='None'):
         human_speech_array1 = audio_prepare_single(left_path)
         human_speech_array2 = audio_prepare_single(right_path)
+    elif left_path=='None':
+        human_speech_array2 = audio_prepare_single(right_path)
+        human_speech_array1 = np.zeros(human_speech_array2.shape[0])
+    elif right_path=='None':
+        human_speech_array1 = audio_prepare_single(left_path)
+        human_speech_array2 = np.zeros(human_speech_array1.shape[0])
 
     if audio_type=='para':
         new_human_speech1 = human_speech_array1

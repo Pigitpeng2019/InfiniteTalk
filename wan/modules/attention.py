@@ -23,10 +23,15 @@ except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 __all__ = [
     'flash_attention',
     'attention',
+    'SparseAttentionConfig',
+    'create_sparse_q_mask',
+    'sparse_attention_wrapper',
 ]
 
 
@@ -391,3 +396,178 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t) 
 
         return x
+
+
+@dataclass
+class SparseAttentionConfig:
+    """
+    Configuration for sparse attention.
+
+    Attributes:
+        enabled: Whether sparse attention is enabled.
+        ratio: Fraction of query tokens to compute full attention for (0.0-1.0).
+               Lower = faster but more approximate.
+        pattern: Sampling pattern for query token selection.
+                 'uniform' = evenly spaced grid sampling.
+                 'random' = random sampling (seed-deterministic).
+    """
+    enabled: bool = False
+    ratio: float = 0.5
+    pattern: str = 'uniform'
+
+
+def create_sparse_q_mask(
+    lq: int,
+    grid_sizes: torch.Tensor,
+    ratio: float,
+    pattern: str = 'uniform',
+) -> torch.Tensor:
+    """
+    Create a boolean mask for selecting a subset of query positions.
+
+    For video tokens, the layout is: [t0_spatial, t1_spatial, ..., tF_spatial]
+    where each temporal slice has H*W spatial tokens.
+
+    Args:
+        lq: Total number of query tokens.
+        grid_sizes: [B, 3] tensor with (F, H, W) grid dimensions.
+        ratio: Fraction of tokens to keep (0.0-1.0).
+        pattern: 'uniform' (grid subsampling) or 'random'.
+
+    Returns:
+        bool mask of shape [lq], True for tokens to compute.
+    """
+    device = grid_sizes.device
+    f, h, w = grid_sizes[0].tolist()
+    spatial_per_frame = h * w
+    total_needed = f * spatial_per_frame
+
+    # If lq is padded (larger than actual tokens), create mask only for actual tokens
+    actual_lq = min(lq, total_needed)
+    num_selected = max(1, int(actual_lq * ratio))
+
+    mask = torch.zeros(lq, dtype=torch.bool, device=device)
+
+    if pattern == 'uniform':
+        # Uniform spatial subsampling: keep every Nth spatial position
+        tokens_per_frame = spatial_per_frame
+        keep_per_frame = max(1, int(tokens_per_frame * ratio))
+        if keep_per_frame >= tokens_per_frame:
+            mask[:actual_lq] = True
+        else:
+            step = max(1, tokens_per_frame // keep_per_frame)
+            for t in range(f):
+                offset = t * tokens_per_frame
+                for idx in range(0, tokens_per_frame, step):
+                    pos = offset + idx
+                    if pos < actual_lq:
+                        mask[pos] = True
+    elif pattern == 'random':
+        # Deterministic random selection (reproducible)
+        rng_state = torch.random.get_rng_state()
+        torch.manual_seed(42)
+        perm = torch.randperm(actual_lq, device=device)
+        torch.random.set_rng_state(rng_state)
+        selected_indices = perm[:num_selected]
+        mask[selected_indices] = True
+    else:
+        # Default: keep all
+        mask[:actual_lq] = True
+
+    return mask
+
+
+def sparse_attention_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sparse_config: SparseAttentionConfig,
+    grid_sizes: torch.Tensor,
+    **flash_kwargs,
+) -> torch.Tensor:
+    """
+    Attention wrapper that applies sparse query selection.
+
+    Full keys and values are kept for context quality, but only a subset of
+    query positions (controlled by ratio) have their attention computed.
+    Uncomputed positions copy the output from the nearest computed neighbor
+    in the same spatial grid position.
+
+    Args:
+        q: [B, Lq, Nq, C1] query tensor.
+        k: [B, Lk, Nk, C1] key tensor.
+        v: [B, Lk, Nk, C2] value tensor.
+        sparse_config: Configuration controlling sparsity.
+        grid_sizes: [B, 3] tensor with (F, H, W).
+        **flash_kwargs: Additional kwargs passed to flash_attention.
+
+    Returns:
+        x: [B, Lq, Nq, C2] full attention output.
+    """
+    if not sparse_config.enabled or sparse_config.ratio >= 1.0:
+        return flash_attention(q, k, v, **flash_kwargs)
+
+    b, lq, nq, c1 = q.shape
+    c2 = v.shape[-1]
+
+    # Create sparse query mask
+    q_mask = create_sparse_q_mask(lq, grid_sizes, sparse_config.ratio, sparse_config.pattern)
+    selected_indices = q_mask.nonzero(as_tuple=True)[0]  # [num_selected]
+
+    if len(selected_indices) == 0:
+        # Fallback: compute all
+        return flash_attention(q, k, v, **flash_kwargs)
+
+    # Select query positions
+    q_selected = q[:, selected_indices, :, :]  # [B, num_selected, Nq, C1]
+
+    # Compute attention only for selected queries, full K/V context
+    flash_kwargs_copy = dict(flash_kwargs)
+    # When q is modified, drop q_lens to let flash_attention handle it uniformly
+    if 'q_lens' in flash_kwargs_copy:
+        flash_kwargs_copy.pop('q_lens')
+
+    out_selected = flash_attention(
+        q=q_selected,
+        k=k,
+        v=v,
+        **flash_kwargs_copy,
+    )  # [B, num_selected, Nq, C2]
+
+    # Expand output back to full length
+    out = torch.zeros(b, lq, nq, c2, dtype=out_selected.dtype, device=out_selected.device)
+
+    # Place computed outputs
+    out[:, selected_indices, :, :] = out_selected
+
+    # Fill uncomputed positions by copying nearest computed neighbor
+    unselected_mask = ~q_mask
+    unselected_indices = unselected_mask.nonzero(as_tuple=True)[0]
+
+    if len(unselected_indices) > 0:
+        # Use spatial-aware nearest neighbor: same temporal frame, nearest spatial
+        f, h, w = grid_sizes[0].tolist()
+        tokens_per_frame = h * w
+
+        for pos in unselected_indices:
+            pos_int = pos.item()
+            if pos_int >= lq:
+                continue
+            # Find nearest selected index in the same temporal frame
+            frame_idx = pos_int // tokens_per_frame
+            frame_start = frame_idx * tokens_per_frame
+            frame_end = min(frame_idx * tokens_per_frame + tokens_per_frame, lq)
+
+            # Selected indices within this frame
+            in_frame_mask = (selected_indices >= frame_start) & (selected_indices < frame_end)
+            in_frame = selected_indices[in_frame_mask]
+
+            if len(in_frame) > 0:
+                nearest = in_frame[torch.argmin(torch.abs(in_frame - pos_int))]
+                out[:, pos_int:pos_int + 1, :, :] = out[:, nearest:nearest + 1, :, :]
+            else:
+                # Fallback: overall nearest selected
+                nearest = selected_indices[torch.argmin(torch.abs(selected_indices - pos_int))]
+                out[:, pos_int:pos_int + 1, :, :] = out[:, nearest:nearest + 1, :, :]
+
+    return out

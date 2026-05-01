@@ -11,7 +11,7 @@ from einops import rearrange
 from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
-from .attention import flash_attention, SingleStreamMutiAttention
+from .attention import flash_attention, SingleStreamMutiAttention, SparseAttentionConfig, sparse_attention_wrapper
 from ..utils.multitalk_utils import get_attn_map_with_target
 import logging
 try:
@@ -128,6 +128,7 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.sparse_config = None  # Set by model.enable_sparse_attention()
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -151,7 +152,18 @@ class WanSelfAttention(nn.Module):
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-        if USE_SAGEATTN:
+        if self.sparse_config is not None and self.sparse_config.enabled:
+            x = sparse_attention_wrapper(
+                q=q,
+                k=k,
+                v=v,
+                sparse_config=self.sparse_config,
+                grid_sizes=grid_sizes,
+                k_lens=seq_lens,
+                window_size=self.window_size,
+            )
+            x = x.type_as(q)
+        elif USE_SAGEATTN:
             x = sageattn(q.to(torch.bfloat16), k.to(torch.bfloat16), v, tensor_layout='NHD')
         else:
             x = flash_attention(
@@ -553,6 +565,38 @@ class WanModel(ModelMixin, ConfigMixin):
             rope_params(1024, 2 * (d // 6))
         ],
                                dim=1)
+
+    def init_sparse_attention(self, ratio=0.5, pattern='uniform'):
+        """
+        Enable sparse attention for all self-attention blocks.
+
+        Sparse attention selects only a subset of query positions during
+        self-attention computation, reducing FLOPs at inference time.
+        Uncomputed positions are filled via nearest-neighbor interpolation
+        from computed positions in the same spatial grid.
+
+        Args:
+            ratio: Fraction of query tokens to compute (0.0-1.0).
+                   Lower = faster but more approximate.
+            pattern: Sampling pattern ('uniform' or 'random').
+        """
+        self.sparse_attention_config = SparseAttentionConfig(
+            enabled=True,
+            ratio=ratio,
+            pattern=pattern,
+        )
+        for block in self.blocks:
+            block.self_attn.sparse_config = self.sparse_attention_config
+        logging.info(
+            f'Sparse attention enabled: ratio={ratio}, pattern={pattern}'
+        )
+
+    def disable_sparse_attention(self):
+        """Disable sparse attention on all self-attention blocks."""
+        self.sparse_attention_config = SparseAttentionConfig(enabled=False)
+        for block in self.blocks:
+            block.self_attn.sparse_config = None
+        logging.info('Sparse attention disabled')
 
     def teacache_init(
         self,

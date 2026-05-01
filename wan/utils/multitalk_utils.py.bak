@@ -244,80 +244,73 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             frame = np.array(frame)
             writer.append_data(frame)
         writer.close()
-
     save_path_tmp = save_path + "-temp.mp4"
+
+    if high_quality_save:
+        cache_video(
+                    tensor=gen_video_samples.unsqueeze(0),
+                    save_file=save_path_tmp,
+                    fps=fps,
+                    nrow=1,
+                    normalize=True,
+                    value_range=(-1, 1)
+                    )
+    else:
+        video_audio = (gen_video_samples+1)/2 # C T H W
+        video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
+        video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)  # to [0, 255]
+        save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
+
+
+    # crop audio according to video length
+    _, T, _, _ = gen_video_samples.shape
+    duration = T / fps
     save_path_crop_audio = save_path + "-cropaudio.wav"
-    save_path_out = save_path + ".mp4"
+    final_command = [
+        "ffmpeg",
+        "-i",
+        vocal_audio_list[0],
+        "-t",
+        f'{duration}',
+        save_path_crop_audio,
+    ]
+    subprocess.run(final_command, check=True)
 
-    def _cleanup_temp_files():
-        for f in [save_path_tmp, save_path_crop_audio]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-    try:
-        if high_quality_save:
-            cache_video(
-                        tensor=gen_video_samples.unsqueeze(0),
-                        save_file=save_path_tmp,
-                        fps=fps,
-                        nrow=1,
-                        normalize=True,
-                        value_range=(-1, 1)
-                        )
-        else:
-            video_audio = (gen_video_samples+1)/2 # C T H W
-            video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
-            video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)  # to [0, 255]
-            save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
-
-
-        # crop audio according to video length
-        _, T, _, _ = gen_video_samples.shape
-        duration = T / fps
+    save_path = save_path + ".mp4"
+    if high_quality_save:
         final_command = [
             "ffmpeg",
-            "-i",
-            vocal_audio_list[0],
-            "-t",
-            f'{duration}',
-            save_path_crop_audio,
+            "-y",
+            "-i", save_path_tmp,
+            "-i", save_path_crop_audio,
+            "-c:v", "libx264",
+            "-crf", "0",
+            "-preset", "veryslow",
+            "-c:a", "aac", 
+            "-shortest",
+            save_path,
         ]
         subprocess.run(final_command, check=True)
-
-        if high_quality_save:
-            final_command = [
-                "ffmpeg",
-                "-y",
-                "-i", save_path_tmp,
-                "-i", save_path_crop_audio,
-                "-c:v", "libx264",
-                "-crf", "0",
-                "-preset", "veryslow",
-                "-c:a", "aac", 
-                "-shortest",
-                save_path_out,
-            ]
-        else:
-            final_command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                save_path_tmp,
-                "-i",
-                save_path_crop_audio,
-                "-c:v",
-                "libx264",
-                "-c:a",
-                "aac",
-                "-shortest",
-                save_path_out,
-            ]
+        os.remove(save_path_tmp)
+        os.remove(save_path_crop_audio)
+    else:
+        final_command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            save_path_tmp,
+            "-i",
+            save_path_crop_audio,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-shortest",
+            save_path,
+        ]
         subprocess.run(final_command, check=True)
-    finally:
-        _cleanup_temp_files()
+        os.remove(save_path_tmp)
+        os.remove(save_path_crop_audio)
 
 
 class MomentumBuffer:

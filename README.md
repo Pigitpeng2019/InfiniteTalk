@@ -62,10 +62,34 @@ We propose **InfiniteTalk**​​, a novel sparse-frame video dubbing framework.
   - [x] TeaCache
   - [x] int8 quantization
   - [ ] LCM distillation
-  - [ ] Sparse Attention
+  - [x] Sparse Attention
 - [x] Run with very low VRAM
 - [x] Gradio demo
 - [x] ComfyUI
+
+## 🚀 新增功能
+
+### Gradio UI 增强
+- 🌐 **中英文界面** — 支持一键切换中英文显示
+- 📋 **任务队列** — 批量任务排队执行，实时进度追踪
+- 📜 **历史记录** — 自动保存生成记录，支持查看/删除
+- ⚙️ **参数预设** — 保存/加载常用配置
+
+### REST API 服务
+- 提供完整的 REST API，支持异步任务提交、查询、取消、下载
+- 端口 8419，与 Gradio 界面（8418）分离
+- 详情见 [docs/api_docs.md](docs/api_docs.md)
+
+### Sparse Attention 加速
+- 推理时稀疏化 attention 计算，降低延迟
+- 支持 `--use_sparse_attention` 和 `--sparse_attention_ratio` 参数
+- 与 TeaCache 可叠加使用
+- 详情见 [docs/sparse_attention.md](docs/sparse_attention.md)
+
+### Docker 一键部署
+- 提供 Dockerfile 和 docker-compose.yml，支持 GPU 容器化部署
+- 包含模型自动下载脚本
+- 详情见 [docs/deployment.md](docs/deployment.md)
 
 ## Video Demos
 

@@ -786,7 +786,7 @@ class TaskManager:
                 if task_id not in self._tasks:
                     self._queue.task_done()
                     continue
-                self._set_status(task_id, "running")
+                self._tasks[task_id]["status"] = "running"
                 self._tasks[task_id]["stage"] = "准备中..."
 
             try:
@@ -794,7 +794,7 @@ class TaskManager:
                 result_path, history_entry = target_func(task_id, self._update_progress)
 
                 with self._lock:
-                    self._set_status(task_id, "completed")
+                    self._tasks[task_id]["status"] = "completed"
                     self._tasks[task_id]["progress"] = 100
                     self._tasks[task_id]["stage"] = "完成"
                     self._tasks[task_id]["result_path"] = result_path
@@ -804,7 +804,7 @@ class TaskManager:
                 import traceback
                 tb = traceback.format_exc()
                 with self._lock:
-                    self._set_status(task_id, "failed")
+                    self._tasks[task_id]["status"] = "failed"
                     self._tasks[task_id]["error"] = str(e)
                     self._tasks[task_id]["traceback"] = tb
                     self._tasks[task_id]["stage"] = "失败"
@@ -814,34 +814,13 @@ class TaskManager:
             finally:
                 self._queue.task_done()
 
-    # Valid state transitions
-    _VALID_TRANSITIONS = {
-        "queued": ["running", "failed"],
-        "running": ["completed", "failed"],
-        "completed": [],
-        "failed": [],
-    }
-
     def _update_progress(self, task_id, progress, stage=""):
         """Update progress for a task (called from worker thread)"""
         with self._lock:
             if task_id in self._tasks:
-                self._tasks[task_id]["progress"] = max(0, min(progress, 99))
+                self._tasks[task_id]["progress"] = min(progress, 99)
                 if stage:
                     self._tasks[task_id]["stage"] = stage
-
-    def _set_status(self, task_id, new_status):
-        """Set task status with validity check"""
-        with self._lock:
-            if task_id not in self._tasks:
-                return False
-            current = self._tasks[task_id]["status"]
-            valid_next = self._VALID_TRANSITIONS.get(current, [])
-            if new_status not in valid_next:
-                logging.warning(f"Invalid status transition: {current} -> {new_status} for task {task_id}")
-                return False
-            self._tasks[task_id]["status"] = new_status
-            return True
 
     def get_task(self, task_id):
         """Get task info by ID"""
@@ -989,17 +968,21 @@ def run_graio_demo(args):
             input_data["cond_video"] = img2vid_image
         person = {}
 
-        if mode_selector == "SingleFile":
+        if mode_selector == "Single Person(Local File)":
             person['person1'] = img2vid_audio_1
-        elif mode_selector == "SingleTTS":
+        elif mode_selector == "Single Person(TTS)":
             tts_audio = {}
             tts_audio['text'] = tts_text
             tts_audio['human1_voice'] = human1_voice
             input_data["tts_audio"] = tts_audio
-        elif mode_selector in ("MultiFileAdd", "MultiFilePara"):
+        elif mode_selector == "Multi Person(Local File, audio add)":
             person['person1'] = img2vid_audio_1
             person['person2'] = img2vid_audio_2
-            input_data["audio_type"] = 'add' if mode_selector == "MultiFileAdd" else 'para'
+            input_data["audio_type"] = 'add'
+        elif mode_selector == "Multi Person(Local File, audio parallel)":
+            person['person1'] = img2vid_audio_1
+            person['person2'] = img2vid_audio_2
+            input_data["audio_type"] = 'para'
         else:
             tts_audio = {}
             tts_audio['text'] = tts_text
@@ -1016,7 +999,7 @@ def run_graio_demo(args):
         try:
             _progress("progress.prepare", 10)
 
-            if mode_selector in ("SingleFile", "MultiFileAdd", "MultiFilePara"):
+            if 'Local File' in mode_selector:
                 if len(input_data['cond_audio']) == 2:
                     new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
                     audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
@@ -1039,7 +1022,7 @@ def run_graio_demo(args):
                     torch.save(audio_embedding, emb_path)
                     input_data['cond_audio']['person1'] = emb_path
                     input_data['video_audio'] = sum_audio
-            elif mode_selector in ("SingleTTS", "MultiTTS"):
+            elif 'TTS' in mode_selector:
                 if 'human2_voice' not in input_data['tts_audio'].keys():
                     new_human_speech1, sum_audio = process_tts_single(input_data['tts_audio']['text'], args.audio_save_dir, input_data['tts_audio']['human1_voice'])
                     audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
@@ -1081,17 +1064,16 @@ def run_graio_demo(args):
             )
 
             _progress("progress.saving", 90)
-            save_file = args.save_file
-            if save_file is None:
+            if args.save_file is None:
                 formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
                 formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/", "_")[:50]
-                save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform == 'win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
+                args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform == 'win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
 
-            logging.info(f"Saving generated video to {save_file}.mp4")
-            save_video_ffmpeg(video, save_file, [input_data['video_audio']], high_quality_save=False)
+            logging.info(f"Saving generated video to {args.save_file}.mp4")
+            save_video_ffmpeg(video, args.save_file, [input_data['video_audio']], high_quality_save=False)
             logging.info("Finished.")
 
-            video_path = save_file + '.mp4'
+            video_path = args.save_file + '.mp4'
             history_entry = {
                 "task_id": task_id or "",
                 "prompt": img2vid_prompt,
@@ -1114,6 +1096,13 @@ def run_graio_demo(args):
             tb = traceback.format_exc()
             logging.error(f"Generation failed [task={task_id}]: {e}")
             logging.error(tb)
+            # Try to save partial result on failure
+            partial_path = None
+            if args.save_file is not None:
+                partial_path = args.save_file + '.mp4'
+                if not os.path.exists(partial_path):
+                    partial_path = None
+
             error_entry = {
                 "task_id": task_id or "",
                 "prompt": img2vid_prompt,
@@ -1305,15 +1294,15 @@ def run_graio_demo(args):
         except (ValueError, IndexError):
             return "Error"
 
-    def save_preset_handler(name, sd_steps_val, seed_val, text_guide_val, audio_guide_val):
+    def save_preset_handler(name):
         """Save current params as a preset"""
         if not name.strip():
             return i18n.t("presets.save") + "... " + i18n.t("error.no_prompt")
         preset_data = {
-            "sd_steps": sd_steps_val,
-            "seed": seed_val,
-            "text_guide_scale": text_guide_val,
-            "audio_guide_scale": audio_guide_val,
+            "sd_steps": 8,
+            "seed": 42,
+            "text_guide_scale": 1.0,
+            "audio_guide_scale": 2.0,
         }
         preset_manager.save_preset(name.strip(), preset_data)
         return i18n.t("presets.saved_msg") + name.strip()
@@ -1330,11 +1319,7 @@ def run_graio_demo(args):
             gr.update(value=data.get("seed", 42)),
             gr.update(value=data.get("text_guide_scale", 1.0)),
             gr.update(value=data.get("audio_guide_scale", 2.0)),
-            gr.update(value=data.get("resolution_select", "infinitetalk-480")),
-            gr.update(value=data.get("n_prompt", "")),
-            gr.update(value=data.get("human1_voice", "weights/Kokoro-82M/voices/am_adam.pt")),
-            gr.update(value=data.get("human2_voice", "weights/Kokoro-82M/voices/af_heart.pt")),
-        ]
+        ] + [gr.update()] * 4
 
     def delete_preset_handler(name):
         if not name:
@@ -1349,27 +1334,12 @@ def run_graio_demo(args):
         return gr.Dropdown(choices=names, value=names[0] if names else None, label=i18n.t("presets.saved"))
 
     # ========== Language handler ==========
-    def handle_lang_change(lang, task_val, mode_val):
+    def handle_lang_change(lang):
         lang_code = "zh" if lang == "中文" else "en"
         i18n.set_lang(lang_code)
         with open(lang_file, "w") as f:
             json.dump({"lang": lang_code}, f)
-        return [
-            f"{i18n.t('settings.language')}: {lang}",
-            gr.update(
-                choices=[("SingleImageDriven", i18n.t("task_mode.single")),
-                         ("VideoDubbing", i18n.t("task_mode.dubbing"))],
-                value=task_val
-            ),
-            gr.update(
-                choices=[("SingleFile", i18n.t("mode.single_file")),
-                         ("SingleTTS", i18n.t("mode.single_tts")),
-                         ("MultiFileAdd", i18n.t("mode.multi_file_add")),
-                         ("MultiFilePara", i18n.t("mode.multi_file_para")),
-                         ("MultiTTS", i18n.t("mode.multi_tts"))],
-                value=mode_val
-            ),
-        ]
+        return f"{i18n.t('settings.language')}: {lang}"
 
     # ========== Existing UI helpers ==========
     def toggle_audio_mode(mode):
@@ -1433,14 +1403,19 @@ def run_graio_demo(args):
                 container=False,
             )
 
+        lang_radio.change(
+            fn=handle_lang_change,
+            inputs=lang_radio,
+            outputs=lang_status,
+        )
+
         with gr.Tabs():
             # ======== TAB 1: GENERATE ========
             with gr.TabItem(i18n.t("tab.generate")):
                 with gr.Row():
                     with gr.Column(scale=1):
                         task_mode = gr.Radio(
-                            choices=[("SingleImageDriven", i18n.t("task_mode.single")),
-                                     ("VideoDubbing", i18n.t("task_mode.dubbing"))],
+                            choices=[i18n.t("task_mode.single"), i18n.t("task_mode.dubbing")],
                             label=i18n.t("task_mode.label"),
                             value="VideoDubbing"
                         )
@@ -1466,14 +1441,14 @@ def run_graio_demo(args):
                         with gr.Accordion(i18n.t("audio.title"), open=True):
                             mode_selector = gr.Radio(
                                 choices=[
-                                    ("SingleFile", i18n.t("mode.single_file")),
-                                    ("SingleTTS", i18n.t("mode.single_tts")),
-                                    ("MultiFileAdd", i18n.t("mode.multi_file_add")),
-                                    ("MultiFilePara", i18n.t("mode.multi_file_para")),
-                                    ("MultiTTS", i18n.t("mode.multi_tts")),
+                                    i18n.t("mode.single_file"),
+                                    i18n.t("mode.single_tts"),
+                                    i18n.t("mode.multi_file_add"),
+                                    i18n.t("mode.multi_file_para"),
+                                    i18n.t("mode.multi_tts"),
                                 ],
                                 label=i18n.t("mode.label"),
-                                value="SingleFile"
+                                value="Single Person(Local File)"
                             )
                             resolution_select = gr.Radio(
                                 choices=["infinitetalk-480", "infinitetalk-720"],
@@ -1567,9 +1542,9 @@ def run_graio_demo(args):
                             examples=[
                                 ['SingleImageDriven', 'examples/single/ref_image.png', None,
                                  "A woman is passionately singing into a professional microphone in a recording studio. She wears large black headphones and a dark cardigan over a gray top. Her long, wavy brown hair frames her face as she looks slightly upwards, her mouth open mid-song. The studio is equipped with various audio equipment, including a mixing console and a keyboard, with soundproofing panels on the walls. The lighting is warm and focused on her, creating a professional and intimate atmosphere. A close-up shot captures her expressive performance.",
-                                 "SingleFile", "examples/single/1.wav", None, None],
+                                 "Single Person(Local File)", "examples/single/1.wav", None, None],
                                 ['VideoDubbing', None, 'examples/single/ref_video.mp4',
-                                 "A man is talking", "SingleFile", "examples/single/1.wav", None, None],
+                                 "A man is talking", "Single Person(Local File)", "examples/single/1.wav", None, None],
                             ],
                             inputs=[task_mode, img2vid_image, vid2vid_vid, img2vid_prompt,
                                     mode_selector, img2vid_audio_1, img2vid_audio_2, tts_text],
@@ -1613,7 +1588,7 @@ def run_graio_demo(args):
                     outputs=[queue_df],
                 )
                 clear_completed_btn.click(
-                    fn=lambda: task_manager.clear_completed() or build_task_df(),
+                    fn=lambda: (task_manager.clear_completed(), build_task_df()),
                     inputs=[],
                     outputs=[queue_df],
                 )
@@ -1654,13 +1629,13 @@ def run_graio_demo(args):
                     inputs=[history_idx],
                     outputs=[history_video],
                 )
-                def _delete_and_refresh(idx):
-                    delete_history_entry(idx)
-                    return build_history_df()
-
                 delete_history_btn.click(
-                    fn=_delete_and_refresh,
+                    fn=delete_history_entry,
                     inputs=[history_idx],
+                    outputs=[history_video],
+                ).then(
+                    fn=build_history_df,
+                    inputs=[],
                     outputs=[history_df],
                 )
 
@@ -1704,7 +1679,7 @@ def run_graio_demo(args):
 
                 save_preset_btn.click(
                     fn=save_preset_handler,
-                    inputs=[preset_name, sd_steps, seed, text_guide_scale, audio_guide_scale],
+                    inputs=[preset_name],
                     outputs=[preset_save_status],
                 ).then(
                     fn=refresh_preset_list,
@@ -1716,7 +1691,8 @@ def run_graio_demo(args):
                     fn=load_preset_handler,
                     inputs=[preset_dropdown],
                     outputs=[sd_steps, seed, text_guide_scale, audio_guide_scale,
-                             resolution_select, n_prompt, human1_voice, human2_voice],
+                             gr.Textbox(value=""), gr.Textbox(value=""),
+                             gr.Textbox(value=""), gr.Textbox(value="")],
                 )
 
                 delete_preset_btn.click(
@@ -1729,18 +1705,12 @@ def run_graio_demo(args):
                     outputs=[preset_dropdown],
                 )
 
-        # Refresh on page load (no periodic polling to avoid overwriting instant results)
+        # Periodic refresh: update the result video every 5 seconds
         demo.load(
             fn=get_latest_video,
             inputs=[],
             outputs=[result_gallery],
-        )
-
-        # Language switch handler (bound after all UI components are created)
-        lang_radio.change(
-            fn=handle_lang_change,
-            inputs=[lang_radio, task_mode, mode_selector],
-            outputs=[lang_status, task_mode, mode_selector],
+            every=5,
         )
 
     demo.queue(default_concurrency_limit=1)
