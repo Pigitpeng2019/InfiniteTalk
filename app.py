@@ -20,6 +20,10 @@ import subprocess
 
 import wan
 from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
+from wan.utils.device_utils import (
+    set_device, get_distributed_backend, is_cuda_device,
+    is_mps_device, is_distributed as device_is_distributed,
+)
 from wan.utils.utils import cache_image, cache_video, str2bool
 from wan.utils.multitalk_utils import save_video_ffmpeg
 from kokoro import KPipeline
@@ -278,7 +282,7 @@ def _parse_args():
 
 
 def custom_init(device, wav2vec):    
-    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
+    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True, attn_implementation="eager").to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec, local_files_only=True)
     return wav2vec_feature_extractor, audio_encoder
@@ -732,7 +736,7 @@ class TaskManager:
     def __init__(self):
         self._queue = queue.Queue()
         self._tasks = {}  # task_id -> task_info dict
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # 使用可重入锁，避免 _worker_loop 中调用 _set_status 时死锁
         self._counter = 0
         self._worker = None
         self._running = False
@@ -881,36 +885,52 @@ def run_graio_demo(args):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
+        if is_cuda_device():
+            set_device(local_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=get_distributed_backend(),
             init_method="env://",
             rank=rank,
             world_size=world_size)
     else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
+        # Gracefully handle CUDA-only features on non-CUDA devices
+        if not is_cuda_device():
+            if args.t5_fsdp or args.dit_fsdp:
+                logging.warning("FSDP requires CUDA. Disabling FSDP for non-CUDA device.")
+                args.t5_fsdp = False
+                args.dit_fsdp = False
+            if args.ulysses_size > 1 or args.ring_size > 1:
+                logging.warning("Context parallelism requires CUDA/xfuser. Disabling for non-CUDA device.")
+                args.ulysses_size = 1
+                args.ring_size = 1
+        else:
+            assert not (
+                args.t5_fsdp or args.dit_fsdp
+            ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
+            assert not (
+                args.ulysses_size > 1 or args.ring_size > 1
+            ), f"context parallel are not supported in non-distributed environments."
 
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
-        from xfuser.core.distributed import (
-            init_distributed_environment,
-            initialize_model_parallel,
-        )
-        init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
+        try:
+            from xfuser.core.distributed import (
+                init_distributed_environment,
+                initialize_model_parallel,
+            )
+            init_distributed_environment(
+                rank=dist.get_rank(), world_size=dist.get_world_size())
+            initialize_model_parallel(
+                sequence_parallel_degree=dist.get_world_size(),
+                ring_degree=args.ring_size,
+                ulysses_degree=args.ulysses_size,
+            )
+        except ImportError:
+            logging.warning("xfuser not available, running without context parallel")
+            args.ulysses_size = 1
+            args.ring_size = 1
 
-        initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
-            ring_degree=args.ring_size,
-            ulysses_degree=args.ulysses_size,
-        )
 
-   
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
         assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
@@ -918,12 +938,12 @@ def run_graio_demo(args):
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
 
-    if dist.is_initialized():
+    if dist.is_available() and dist.is_initialized():
         base_seed = [args.base_seed] if rank == 0 else [None]
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
 
-    assert args.task == "infinitetalk-14B", 'You should choose multitalk in args.task.'
+    assert args.task == "infinitetalk-14B", 'You should choose infinitetalk in args.task.'
 
     wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
     os.makedirs(args.audio_save_dir,exist_ok=True)
@@ -1121,7 +1141,7 @@ def run_graio_demo(args):
                 "mode_selector": mode_selector,
                 "resolution": resolution_select,
                 "seed": seed,
-                "result_path": partial_path,
+                "result_path": None,
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "error": str(e),
             }
@@ -1248,14 +1268,37 @@ def run_graio_demo(args):
                 return path
         return None
 
+    def _build_table_html(headers, rows_data, empty_msg=None):
+        """Build an HTML table string (replaces gr.Dataframe to avoid Gradio 6 Svelte bug)."""
+        if empty_msg:
+            return f'<div style="padding:16px;text-align:center;color:#888;font-size:14px;">{empty_msg}</div>'
+        header_cells = "".join(
+            f'<th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;text-align:left;font-weight:600;font-size:13px;white-space:nowrap;">{h}</th>'
+            for h in headers
+        )
+        row_html = ""
+        for i, cells in enumerate(rows_data):
+            bg = "background:#f9fafb;" if i % 2 == 1 else ""
+            row_html += "<tr style='" + bg + "'>" + "".join(
+                f'<td style="padding:6px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;">{c}</td>'
+                for c in cells
+            ) + "</tr>"
+        return f'''<div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:8px;">
+<table style="width:100%;border-collapse:collapse;font-size:14px;">
+<thead><tr>{header_cells}</tr></thead>
+<tbody>{row_html}</tbody>
+</table></div>'''
+
     def build_task_df():
-        """Build dataframe from task list"""
+        """Build HTML table from task list"""
         tasks = task_manager.get_all_tasks()
         if not tasks:
-            headers = [i18n.t("queue.id"), i18n.t("queue.status"), i18n.t("queue.progress"), i18n.t("queue.created")]
-            return gr.Dataframe(value=[[i18n.t("queue.empty"), "", "", ""]], headers=headers, visible=True, interactive=False)
+            return _build_table_html(
+                [i18n.t("queue.id"), i18n.t("queue.status"), i18n.t("queue.progress"), i18n.t("queue.created")],
+                [], empty_msg=i18n.t("queue.empty")
+            )
 
-        rows = []
+        rows_data = []
         headers = [i18n.t("queue.id"), i18n.t("queue.status"), i18n.t("queue.progress"), i18n.t("queue.stage"), i18n.t("queue.created")]
         for t in reversed(tasks):
             if t["status"] == "queued":
@@ -1269,24 +1312,26 @@ def run_graio_demo(args):
             else:
                 status_text = t["status"]
             prog = f"{t['progress']}%"
-            rows.append([t["id"], status_text, prog, t["stage"], t["created_at"]])
-        return gr.Dataframe(value=rows, headers=headers, visible=True, interactive=False)
+            rows_data.append([t["id"], status_text, prog, t["stage"], t["created_at"]])
+        return _build_table_html(headers, rows_data)
 
     def build_history_df():
-        """Build dataframe from history"""
+        """Build HTML table from history"""
         entries = history_manager.get_entries(50)
         if not entries:
-            headers = [i18n.t("history.prompt"), i18n.t("history.resolution"), i18n.t("history.created")]
-            return gr.Dataframe(value=[[i18n.t("history.empty"), "", ""]], headers=headers, visible=True, interactive=False)
+            return _build_table_html(
+                [i18n.t("history.prompt"), i18n.t("history.resolution"), i18n.t("history.created")],
+                [], empty_msg=i18n.t("history.empty")
+            )
 
-        rows = []
+        rows_data = []
         headers = ["#", i18n.t("history.prompt")[:30], i18n.t("history.resolution"), i18n.t("history.created")]
         for idx, e in enumerate(entries):
             prompt_short = e.get("prompt", "")[:40]
             if len(e.get("prompt", "")) > 40:
                 prompt_short += "..."
-            rows.append([str(idx), prompt_short, e.get("resolution", ""), e.get("created_at", "")])
-        return gr.Dataframe(value=rows, headers=headers, visible=True, interactive=False)
+            rows_data.append([str(idx), prompt_short, e.get("resolution", ""), e.get("created_at", "")])
+        return _build_table_html(headers, rows_data)
 
     def get_history_video(idx):
         """Get video path from history entry"""
@@ -1352,23 +1397,32 @@ def run_graio_demo(args):
     def handle_lang_change(lang, task_val, mode_val):
         lang_code = "zh" if lang == "中文" else "en"
         i18n.set_lang(lang_code)
-        with open(lang_file, "w") as f:
-            json.dump({"lang": lang_code}, f)
+        try:
+            with open(lang_file, "w") as f:
+                json.dump({"lang": lang_code}, f)
+        except (OSError, IOError):
+            pass  # Non-critical; UI still updates correctly
+        # 统一使用 gr.update() 返回，不使用 mix 模式
         return [
-            f"{i18n.t('settings.language')}: {lang}",
+            gr.update(value=f"{i18n.t('settings.language')}: {lang}"),
+            gr.update(value=f"**{i18n.t('settings.language')}**"),
+            gr.update(value=f"**{i18n.t('task_mode.label')}**"),
             gr.update(
-                choices=[("SingleImageDriven", i18n.t("task_mode.single")),
-                         ("VideoDubbing", i18n.t("task_mode.dubbing"))],
-                value=task_val
+                choices=["SingleImageDriven", "VideoDubbing"],
+                value=task_val,
             ),
+            gr.update(value=f"**{i18n.t('mode.label')}**"),
             gr.update(
-                choices=[("SingleFile", i18n.t("mode.single_file")),
-                         ("SingleTTS", i18n.t("mode.single_tts")),
-                         ("MultiFileAdd", i18n.t("mode.multi_file_add")),
-                         ("MultiFilePara", i18n.t("mode.multi_file_para")),
-                         ("MultiTTS", i18n.t("mode.multi_tts"))],
-                value=mode_val
+                choices=[
+                    "SingleFile",
+                    "SingleTTS",
+                    "MultiFileAdd",
+                    "MultiFilePara",
+                    "MultiTTS",
+                ],
+                value=mode_val,
             ),
+            gr.update(value=f"**{i18n.t('resolution.label')}**"),
         ]
 
     # ========== Existing UI helpers ==========
@@ -1416,13 +1470,16 @@ def run_graio_demo(args):
                     """)
 
         with gr.Row():
-            lang_radio = gr.Radio(
-                choices=["中文", "English"],
-                value="中文" if i18n.get_lang() == "zh" else "English",
-                label=i18n.t("settings.language"),
-                scale=0,
-                min_width=200,
-            )
+            lang_label = gr.Markdown(f"**{i18n.t('settings.language')}**")
+            with gr.Column(scale=0, min_width=200):
+                lang_radio = gr.Dropdown(
+                    choices=["中文", "English"],
+                    value="中文" if i18n.get_lang() == "zh" else "English",
+                    show_label=False,
+                    interactive=True,
+                    scale=0,
+                    min_width=120,
+                )
             lang_status = gr.Textbox(
                 label="",
                 value="",
@@ -1438,10 +1495,10 @@ def run_graio_demo(args):
             with gr.TabItem(i18n.t("tab.generate")):
                 with gr.Row():
                     with gr.Column(scale=1):
+                        task_mode_label = gr.Markdown(f"**{i18n.t('task_mode.label')}**")
                         task_mode = gr.Radio(
-                            choices=[("SingleImageDriven", i18n.t("task_mode.single")),
-                                     ("VideoDubbing", i18n.t("task_mode.dubbing"))],
-                            label=i18n.t("task_mode.label"),
+                            choices=["SingleImageDriven", "VideoDubbing"],
+                            show_label=False,
                             value="VideoDubbing"
                         )
                         vid2vid_vid = gr.Video(
@@ -1464,20 +1521,22 @@ def run_graio_demo(args):
                         )
 
                         with gr.Accordion(i18n.t("audio.title"), open=True):
+                            mode_label = gr.Markdown(f"**{i18n.t('mode.label')}**")
                             mode_selector = gr.Radio(
                                 choices=[
-                                    ("SingleFile", i18n.t("mode.single_file")),
-                                    ("SingleTTS", i18n.t("mode.single_tts")),
-                                    ("MultiFileAdd", i18n.t("mode.multi_file_add")),
-                                    ("MultiFilePara", i18n.t("mode.multi_file_para")),
-                                    ("MultiTTS", i18n.t("mode.multi_tts")),
+                                    "SingleFile",
+                                    "SingleTTS",
+                                    "MultiFileAdd",
+                                    "MultiFilePara",
+                                    "MultiTTS",
                                 ],
-                                label=i18n.t("mode.label"),
+                                show_label=False,
                                 value="SingleFile"
                             )
+                            resolution_label = gr.Markdown(f"**{i18n.t('resolution.label')}**")
                             resolution_select = gr.Radio(
                                 choices=["infinitetalk-480", "infinitetalk-720"],
-                                label=i18n.t("resolution.label"),
+                                show_label=False,
                                 value="infinitetalk-480"
                             )
                             img2vid_audio_1 = gr.Audio(
@@ -1600,11 +1659,11 @@ def run_graio_demo(args):
                 with gr.Row():
                     refresh_queue_btn = gr.Button(i18n.t("btn.refresh"))
                     clear_completed_btn = gr.Button(i18n.t("btn.clear_completed"))
-                queue_df = gr.Dataframe(
-                    headers=[i18n.t("queue.id"), i18n.t("queue.status"), i18n.t("queue.progress"), i18n.t("queue.stage"), i18n.t("queue.created")],
-                    value=[[i18n.t("queue.empty"), "", "", "", ""]],
-                    interactive=False,
-                    visible=True,
+                queue_df = gr.HTML(
+                    value=_build_table_html(
+                        [i18n.t("queue.id"), i18n.t("queue.status"), i18n.t("queue.progress"), i18n.t("queue.stage"), i18n.t("queue.created")],
+                        [], empty_msg=i18n.t("queue.empty")
+                    ),
                 )
 
                 refresh_queue_btn.click(
@@ -1623,11 +1682,11 @@ def run_graio_demo(args):
                 gr.Markdown(f"### {i18n.t('history.title')}")
                 with gr.Row():
                     refresh_history_btn = gr.Button(i18n.t("btn.refresh"))
-                history_df = gr.Dataframe(
-                    headers=["#", i18n.t("history.prompt")[:30], i18n.t("history.resolution"), i18n.t("history.created")],
-                    value=[[i18n.t("history.empty"), "", "", ""]],
-                    interactive=False,
-                    visible=True,
+                history_df = gr.HTML(
+                    value=_build_table_html(
+                        ["#", i18n.t("history.prompt")[:30], i18n.t("history.resolution"), i18n.t("history.created")],
+                        [], empty_msg=i18n.t("history.empty")
+                    ),
                 )
                 with gr.Row():
                     history_idx = gr.Textbox(
@@ -1737,14 +1796,16 @@ def run_graio_demo(args):
         )
 
         # Language switch handler (bound after all UI components are created)
-        lang_radio.change(
+        # 使用 .input() 事件而非 .change()，避免 Gradio 6 的 Radio change 事件级联 bug
+        lang_radio.input(
             fn=handle_lang_change,
             inputs=[lang_radio, task_mode, mode_selector],
-            outputs=[lang_status, task_mode, mode_selector],
+            outputs=[lang_status, lang_label, task_mode_label, task_mode, mode_label, mode_selector, resolution_label],
+            concurrency_limit=None,
         )
 
     demo.queue(default_concurrency_limit=1)
-    demo.launch(server_name="0.0.0.0", debug=True, server_port=8418)
+    demo.launch(server_name="0.0.0.0", debug=True, server_port=8418, show_error=True)
 
         
 

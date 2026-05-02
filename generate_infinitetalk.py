@@ -16,6 +16,11 @@ import torch.distributed as dist
 from PIL import Image
 import subprocess
 
+from wan.utils.device_utils import (
+    set_device, get_distributed_backend, is_distributed,
+    is_cuda_device, is_mps_device,
+)
+
 import wan
 from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.utils import str2bool, is_video, split_wav_librosa
@@ -287,7 +292,7 @@ def _parse_args():
     return args
 
 def custom_init(device, wav2vec):    
-    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
+    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True, attn_implementation="eager").to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec, local_files_only=True)
     return wav2vec_feature_extractor, audio_encoder
@@ -475,34 +480,52 @@ def generate(args):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
+        if is_cuda_device():
+            set_device(local_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=get_distributed_backend(),
             init_method="env://",
             rank=rank,
             world_size=world_size)
     else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
+        # Gracefully handle CUDA-only features on non-CUDA devices
+        if not is_cuda_device():
+            if args.t5_fsdp or args.dit_fsdp:
+                logging.warning("FSDP requires CUDA. Disabling FSDP for non-CUDA device.")
+                args.t5_fsdp = False
+                args.dit_fsdp = False
+            if args.ulysses_size > 1 or args.ring_size > 1:
+                logging.warning("Context parallelism requires CUDA/xfuser. Disabling for non-CUDA device.")
+                args.ulysses_size = 1
+                args.ring_size = 1
+        else:
+            assert not (
+                args.t5_fsdp or args.dit_fsdp
+            ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
+            assert not (
+                args.ulysses_size > 1 or args.ring_size > 1
+            ), f"context parallel are not supported in non-distributed environments."
 
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
-        from xfuser.core.distributed import (
-            init_distributed_environment,
-            initialize_model_parallel,
-        )
-        init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
-
-        initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
-            ring_degree=args.ring_size,
-            ulysses_degree=args.ulysses_size,
-        )
+        # xfuser distributed — tries import, falls back gracefully
+        if args.ulysses_size > 1 or args.ring_size > 1:
+            try:
+                from xfuser.core.distributed import (
+                    init_distributed_environment,
+                    initialize_model_parallel,
+                )
+                init_distributed_environment(
+                    rank=dist.get_rank(), world_size=dist.get_world_size())
+                initialize_model_parallel(
+                    sequence_parallel_degree=dist.get_world_size(),
+                    ring_degree=args.ring_size,
+                    ulysses_degree=args.ulysses_size,
+                )
+            except ImportError:
+                logging.warning("xfuser not available, running without context parallel")
+                args.ulysses_size = 1
+                args.ring_size = 1
 
     # TODO: use prompt refine
     # if args.use_prompt_extend:
@@ -526,7 +549,7 @@ def generate(args):
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
 
-    if dist.is_initialized():
+    if dist.is_available() and dist.is_initialized():
         base_seed = [args.base_seed] if rank == 0 else [None]
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]

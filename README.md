@@ -69,11 +69,19 @@ We propose **InfiniteTalk**​​, a novel sparse-frame video dubbing framework.
 
 ## 🚀 新增功能
 
+### Mac (Apple Silicon / MPS) 支持
+- **设备无关架构** — 自动适配 CUDA / MPS / CPU，无需手动切换
+- **原生 PyTorch SDPA** — 替代 xformers/flash-attention，在 MPS 上使用 `scaled_dot_product_attention`
+- **PyAV 替代 Decord** — 视频读写使用 `av` 库，兼容 Mac 环境
+- **自动降级** — xfuser、optimum-quanto、FSDP 等在非 CUDA 设备上自动跳过
+- **注意事项** — 14B 模型需要 ~28GB+ 统一内存，首次加载较慢（T5 模型 11GB）
+
 ### Gradio UI 增强
 - 🌐 **中英文界面** — 支持一键切换中英文显示
 - 📋 **任务队列** — 批量任务排队执行，实时进度追踪
 - 📜 **历史记录** — 自动保存生成记录，支持查看/删除
 - ⚙️ **参数预设** — 保存/加载常用配置
+- ⚠️ **Gradio 版本** — 仅支持 Gradio 5.x（已锁定 `<6`，Gradio 6 前端存在兼容性问题）
 
 ### REST API 服务
 - 提供完整的 REST API，支持异步任务提交、查询、取消、下载
@@ -90,6 +98,11 @@ We propose **InfiniteTalk**​​, a novel sparse-frame video dubbing framework.
 - 提供 Dockerfile 和 docker-compose.yml，支持 GPU 容器化部署
 - 包含模型自动下载脚本
 - 详情见 [docs/deployment.md](docs/deployment.md)
+
+### TeaCache 推理加速
+- 推理时跳过冗余计算步骤，降低延迟
+- 支持 `--use_teacache` 和 `--teacache_thresh` 参数
+- 详情见 [docs/teacache.md](docs/teacache.md)
 
 ## Video Demos
 
@@ -153,37 +166,69 @@ We propose **InfiniteTalk**​​, a novel sparse-frame video dubbing framework.
 
 ### 🛠️Installation
 
-#### 1. Create a conda environment and install pytorch, xformers
-```
-conda create -n multitalk python=3.10
-conda activate multitalk
-pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -U xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu121
-```
-#### 2. Flash-attn installation:
-```
-pip install misaki[en]
-pip install ninja 
-pip install psutil 
-pip install packaging
-pip install wheel
-pip install flash_attn==2.7.4.post1
+Choose your platform:
+
+<details>
+<summary><b>Mac (Apple Silicon / MPS)</b></summary>
+
+```bash
+# 1. 创建虚拟环境
+python3 -m venv venv_mac
+source venv_mac/bin/activate
+
+# 2. Install PyTorch (Mac — MPS compatible)
+pip install torch torchvision torchaudio
+
+# 3. Install Mac-specific dependencies
+pip install -r requirements-mac.txt
+
+# 4. Install FFmpeg
+brew install ffmpeg
 ```
 
-#### 3. Other dependencies
-```
+> **Mac 注意事项：**
+> - Mac MPS 不支持 xformers、flash-attn、xfuser、FSDP、量化等 CUDA 专用功能，这些会自动跳过
+> - 模型使用原生 PyTorch SDPA (`torch.nn.functional.scaled_dot_product_attention`)
+> - 视频解码使用 PyAV 替代 Decord（`pip install av`）
+> - **14B 模型需要 ~28GB+ 统一内存**，24GB Mac 可能需要使用 `--num_persistent_param_in_dit 0` 分片加载
+> - 首次启动加载 T5 模型（约 11GB）可能需要 5-10 分钟，请耐心等待
+> - 如果遇到 `killed` 或内存错误，请减少 `--frame_num` 值或使用更小的分辨率
+> - 安装依赖请使用 `requirements-mac.txt`（不含 CUDA 专用包）
+> - Gradio 仅支持 5.x 版本（`<6`），Gradio 6 前端存在按钮点击兼容性问题
+</details>
+
+<details>
+<summary><b>Linux (CUDA GPU)</b></summary>
+
+```bash
+# 1. 创建虚拟环境
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install PyTorch with CUDA
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# 3. Install dependencies
 pip install -r requirements.txt
-conda install -c conda-forge librosa
+# Mac 用户请使用: pip install -r requirements-mac.txt
+
+# 4. [可选] CUDA 优化组件（提升性能）
+pip install xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu124
+MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+pip install xfuser>=0.4.1
+pip install optimum-quanto==0.2.6
+
+# 4. FFmpeg
+sudo apt install ffmpeg   # Ubuntu/Debian
+# conda install -c conda-forge ffmpeg
 ```
 
-#### 4. FFmeg installation
-```
-conda install -c conda-forge ffmpeg
-```
-or
-```
-sudo yum install ffmpeg ffmpeg-devel
-```
+> **Linux 注意事项：**
+> - CUDA 优化组件为可选项，`pip install -r requirements.txt` 已包含所有必需依赖
+> - flash-attn 编译需要较长时间，推荐使用 `MAX_JOBS=4` 限制并行度
+> - 对于低显存 GPU，使用 `--num_persistent_param_in_dit 0` 启用显存管理
+</details>
 
 ### 🧱Model Preparation
 
@@ -366,25 +411,49 @@ python generate_infinitetalk.py \
 
 #### 4. Run with Gradio
 
+Gradio Web 界面提供以下功能：
+- **任务模式**：单图驱动（I2V）或视频配音（V2V）
+- **音频模式**：单人/多人，本地音频文件或 TTS 文字转语音
+- **任务队列**：批量添加生成任务，后台依次执行
+- **历史记录**：自动保存生成结果，支持查看和删除
+- **参数预设**：保存常用参数配置，快速切换
 
-
-```
+```bash
+# 单人模式
 python app.py \
     --ckpt_dir weights/Wan2.1-I2V-14B-480P \
     --wav2vec_dir 'weights/chinese-wav2vec2-base' \
     --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
     --num_persistent_param_in_dit 0 \
-    --motion_frame 9 
-```
-or
-```
+    --motion_frame 9
+
+# 多人模式
 python app.py \
     --ckpt_dir weights/Wan2.1-I2V-14B-480P \
     --wav2vec_dir 'weights/chinese-wav2vec2-base' \
     --infinitetalk_dir weights/InfiniteTalk/multi/infinitetalk.safetensors \
     --num_persistent_param_in_dit 0 \
-    --motion_frame 9 
+    --motion_frame 9
 ```
+
+> 启动后访问 `http://localhost:8418` 打开 Web 界面。
+
+#### 5. Run with REST API
+
+REST API 服务提供 HTTP 接口，支持编程式调用：
+
+```bash
+python api_server.py \
+    --ckpt_dir weights/Wan2.1-I2V-14B-480P \
+    --wav2vec_dir 'weights/chinese-wav2vec2-base' \
+    --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
+    --num_persistent_param_in_dit 0 \
+    --motion_frame 9 \
+    --port 8419
+```
+
+> 启动后访问 `http://localhost:8419/docs` 查看 API 文档。
+> 详情见 [docs/api_docs.md](docs/api_docs.md)
 
 
 ## 📚 Citation

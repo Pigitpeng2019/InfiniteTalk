@@ -28,8 +28,5 @@ hf_transfer
 einops
 safetensors>=0.4.0
 
-# ── Optional: CUDA-optimized kernels (Linux only) ─────
-# xformers>=0.0.28
-# flash-attn>=2.7.4
-# xfuser>=0.4.1
-# optimum-quanto==0.2.6
+# ── Mac 可选的音频处理包 ──
+# pip install pyworld  # 需编译，可选
